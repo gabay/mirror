@@ -7,3 +7,5 @@ mirror
 dist/
 bin/
 .DS_Store
+Dockerfile
+Makefile

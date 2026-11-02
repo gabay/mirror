@@ -30,4 +30,4 @@ VOLUME ["/data", "/var/lib/mirror"]
 
 EXPOSE 22001/tcp 22002/udp
 
-ENTRYPOINT ["/usr/local/bin/mirror"]
+ENTRYPOINT ["mirror"]

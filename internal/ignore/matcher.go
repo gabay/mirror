@@ -113,7 +113,7 @@ func (m *Matcher) matchSingle(subPath, baseName string, isDir bool) bool {
 
 		// Pattern contains '/': match against subPath (or any suffix of subPath if not anchored).
 		if r.anchored {
-			if matchPathSegments( strings.Split(r.pattern, "/"), strings.Split(subPath, "/") ) {
+			if matchPathSegments(strings.Split(r.pattern, "/"), strings.Split(subPath, "/")) {
 				return true
 			}
 		} else {

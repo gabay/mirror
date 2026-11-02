@@ -267,9 +267,9 @@ func TestEngine_EmptyNodeJoiningDoesNotDeleteExistingClusterData(t *testing.T) {
 	defer existingNode.close()
 
 	files := map[string][]byte{
-		"alpha.txt":        []byte("alpha data"),
-		"dir1/beta.txt":    []byte("beta data"),
-		"dir1/dir2/gamma":  []byte("gamma data"),
+		"alpha.txt":       []byte("alpha data"),
+		"dir1/beta.txt":   []byte("beta data"),
+		"dir1/dir2/gamma": []byte("gamma data"),
 	}
 	for rel, content := range files {
 		abs := filepath.Join(existingNode.dataDir, filepath.FromSlash(rel))

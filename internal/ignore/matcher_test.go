@@ -91,25 +91,25 @@ func TestMatcherCustomPatterns(t *testing.T) {
 }
 
 func BenchmarkMatcher(b *testing.B) {
-m := NewMatcher([]string{
-	"*.tmp",
-	".git",
-	"node_modules",
-	"cache/**",
-	"logs/*.log",
-	"/root-only",
-	"build/",
-	"a/**/z/*.bak",
-})
-paths := []string{
-	"config/app.yaml",
-	"deep/nested/dir/sqlite.db",
-	"web/node_modules/pkg/index.js",
-	"cache/a/b/c.bin",
-	"service/logs/error.log",
-}
-b.ResetTimer()
-for i := 0; i < b.N; i++ {
-	_ = m.Match(paths[i%len(paths)], false)
-}
+	m := NewMatcher([]string{
+		"*.tmp",
+		".git",
+		"node_modules",
+		"cache/**",
+		"logs/*.log",
+		"/root-only",
+		"build/",
+		"a/**/z/*.bak",
+	})
+	paths := []string{
+		"config/app.yaml",
+		"deep/nested/dir/sqlite.db",
+		"web/node_modules/pkg/index.js",
+		"cache/a/b/c.bin",
+		"service/logs/error.log",
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = m.Match(paths[i%len(paths)], false)
+	}
 }

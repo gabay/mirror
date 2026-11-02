@@ -254,25 +254,25 @@ func TestChunkFileAndCustomOptions(t *testing.T) {
 }
 
 func BenchmarkHashBytes64KB(b *testing.B) {
-data := make([]byte, 64*1024)
-rng := rand.New(rand.NewSource(1))
-_, _ = rng.Read(data)
-b.SetBytes(int64(len(data)))
-b.ResetTimer()
-for i := 0; i < b.N; i++ {
-	_ = HashBytes(data)
-}
+	data := make([]byte, 64*1024)
+	rng := rand.New(rand.NewSource(1))
+	_, _ = rng.Read(data)
+	b.SetBytes(int64(len(data)))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = HashBytes(data)
+	}
 }
 
 func BenchmarkChunkReader1MB(b *testing.B) {
-data := make([]byte, 1024*1024)
-rng := rand.New(rand.NewSource(2))
-_, _ = rng.Read(data)
-b.SetBytes(int64(len(data)))
-b.ResetTimer()
-for i := 0; i < b.N; i++ {
-	if _, _, _, err := ChunkReader(bytes.NewReader(data)); err != nil {
-		b.Fatal(err)
+	data := make([]byte, 1024*1024)
+	rng := rand.New(rand.NewSource(2))
+	_, _ = rng.Read(data)
+	b.SetBytes(int64(len(data)))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, _, _, err := ChunkReader(bytes.NewReader(data)); err != nil {
+			b.Fatal(err)
+		}
 	}
-}
 }

@@ -317,28 +317,28 @@ func TestStoreConcurrentAccess(t *testing.T) {
 }
 
 func BenchmarkStoreLookupBlock(b *testing.B) {
-s, err := Open(b.TempDir())
-if err != nil {
-	b.Fatal(err)
-}
-defer s.Close()
+	s, err := Open(b.TempDir())
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer s.Close()
 
-targetHash := makeHash(42)
-fi := model.FileInfo{
-	Path:    "db/state.sqlite",
-	Type:    model.FileTypeRegular,
-	Size:    65536,
-	Version: model.VersionVector{"n1": 1},
-	Blocks: []model.BlockInfo{
-		{Index: 0, Offset: 0, Size: 65536, Hash: targetHash},
-	},
-}
-if err := s.PutFile(fi); err != nil {
-	b.Fatal(err)
-}
+	targetHash := makeHash(42)
+	fi := model.FileInfo{
+		Path:    "db/state.sqlite",
+		Type:    model.FileTypeRegular,
+		Size:    65536,
+		Version: model.VersionVector{"n1": 1},
+		Blocks: []model.BlockInfo{
+			{Index: 0, Offset: 0, Size: 65536, Hash: targetHash},
+		},
+	}
+	if err := s.PutFile(fi); err != nil {
+		b.Fatal(err)
+	}
 
-b.ResetTimer()
-for i := 0; i < b.N; i++ {
-	_, _ = s.LookupBlock(targetHash)
-}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = s.LookupBlock(targetHash)
+	}
 }
