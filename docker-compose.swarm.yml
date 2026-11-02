@@ -1,0 +1,45 @@
+version: "3.8"
+
+services:
+  mirror:
+    image: mirror:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      MIRROR_PATH: /data
+      MIRROR_STATE_DIR: /var/lib/mirror
+      MIRROR_LISTEN_ADDR: ":22001"
+      # Automatically discover all peer containers in the Swarm service via internal DNS
+      MIRROR_DISCOVERY_DNS: "tasks.mirror"
+      # Disable UDP broadcast when running on an overlay network; rely on Swarm DNS discovery
+      MIRROR_DISCOVERY_LAN: "false"
+      MIRROR_DISCOVERY_PORT: "22002"
+      # Shared secret — all nodes MUST configure the exact same secret (including empty)
+      MIRROR_SECRET: "${MIRROR_SECRET:-change-me-cluster-secret}"
+      # Comma-separated glob patterns for files and directories to exclude from sync
+      MIRROR_EXCLUDE: "*.tmp,*.swp,.git,node_modules"
+      # Conflict resolution strategy: "lww" (default) or "keep-copy"
+      MIRROR_CONFLICT_STRATEGY: "lww"
+      MIRROR_DEBOUNCE_DELAY: "500ms"
+      MIRROR_RESCAN_INTERVAL: "60s"
+      MIRROR_LOG_LEVEL: "info"
+    volumes:
+      # Bind-mount the host directory to keep synchronized across all Swarm nodes
+      - /srv/mirror/data:/data
+      # Persist local node_id and version vector state DB outside /data on each Swarm host
+      - /srv/mirror/state:/var/lib/mirror
+    networks:
+      - mirror-net
+    deploy:
+      # Run exactly one mirror instance on every node in the Docker Swarm cluster
+      mode: global
+      endpoint_mode: dnsrr
+      restart_policy:
+        condition: any
+        delay: 5s
+
+networks:
+  mirror-net:
+    driver: overlay
+    attachable: true

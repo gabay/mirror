@@ -1,0 +1,9 @@
+.git
+.gitignore
+*.test
+*.out
+coverage.txt
+mirror
+dist/
+bin/
+.DS_Store
