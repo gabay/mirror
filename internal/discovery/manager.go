@@ -84,6 +84,7 @@ func (m *Manager) Run(ctx context.Context) error {
 
 	// 1. Static peer announcer.
 	if len(m.cfg.Peers) > 0 {
+		m.logger.Info("static peer discovery enabled", "peers", m.cfg.Peers)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()

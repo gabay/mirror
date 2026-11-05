@@ -102,6 +102,12 @@ func NewWatcher(
 		return nil, fmt.Errorf("watcher: register initial watches on %q: %w", w.rootDir, err)
 	}
 
+	w.logger.Info("filesystem watcher started",
+		"root_dir", w.rootDir,
+		"watched_dirs", w.WatchCount(),
+		"debounce_delay", w.debounceDelay.String(),
+	)
+
 	w.wg.Add(2)
 	go w.readLoop()
 	go w.debounceLoop()
@@ -338,6 +344,12 @@ func (w *Watcher) parseEvents(buf []byte) {
 			continue
 		}
 
+		w.logger.Debug("watcher event detected",
+			"path", evRel,
+			"is_dir", isDir,
+			"mask", fmt.Sprintf("0x%x", mask),
+		)
+
 		if isDir && mask&(syscall.IN_CREATE|syscall.IN_MOVED_TO) != 0 {
 			subAbs := filepath.Join(w.rootDir, filepath.FromSlash(evRel))
 			discovered, err := w.addSubtreeWatches(subAbs)
@@ -397,6 +409,7 @@ func (w *Watcher) debounceLoop() {
 		clear(pending)
 		sort.Strings(paths)
 
+		w.logger.Debug("watcher flushing debounced changes", "paths", paths)
 		if w.onChanges != nil {
 			w.onChanges(paths)
 		}

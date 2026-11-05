@@ -30,7 +30,7 @@ import (
 const (
 	defaultDialTimeout         = 5 * time.Second
 	defaultBlockRequestTimeout = 30 * time.Second
-	defaultDiscoveryPoll       = 1 * time.Second
+	defaultDiscoveryPoll       = 5 * time.Second
 	maxConcurrentBlockServes   = 64
 )
 
@@ -200,6 +200,10 @@ func (s *PeerSession) readLoop() {
 			if !ok {
 				continue
 			}
+			s.engine.logger.Debug("received IndexExchange from peer",
+				"remote_node_id", s.NodeID(),
+				"entries", len(idx.Files),
+			)
 			s.engine.enqueueReconcile(s, idx.Files)
 
 		case protocol.MsgIndexUpdate:
@@ -207,6 +211,10 @@ func (s *PeerSession) readLoop() {
 			if !ok {
 				continue
 			}
+			s.engine.logger.Debug("received IndexUpdate from peer",
+				"remote_node_id", s.NodeID(),
+				"entries", len(upd.Files),
+			)
 			s.engine.enqueueReconcile(s, upd.Files)
 
 		case protocol.MsgBlockRequest:
@@ -535,8 +543,19 @@ func (e *Engine) Start(ctx context.Context) error {
 	e.logger.Info("sync engine started",
 		"node_id", e.cfg.NodeID,
 		"listen_addr", boundAddr,
+		"socket_listen_addr", ln.Addr().String(),
 		"path", e.cfg.Path,
+		"state_dir", e.cfg.StateDir,
+		"tracked_files", len(e.store.ListFiles()),
+		"discovery_lan", e.cfg.DiscoveryLAN,
+		"discovery_port", e.cfg.DiscoveryPort,
+		"discovery_dns", e.cfg.DiscoveryDNS,
+		"static_peers", e.cfg.Peers,
+		"exclude", e.cfg.Exclude,
 		"conflict_strategy", e.cfg.ConflictStrategy,
+		"debounce_delay", e.cfg.DebounceDelay.String(),
+		"rescan_interval", e.cfg.RescanInterval.String(),
+		"has_secret", e.cfg.Secret != "",
 	)
 	return nil
 }
@@ -622,10 +641,22 @@ func (e *Engine) onLocalChanges(paths []string) {
 		e.logger.Warn("incremental scan failed", "paths", paths, "err", err)
 		return
 	}
-	if len(changed) > 0 {
-		e.logger.Debug("broadcasting local filesystem updates", "count", len(changed))
-		e.broadcastIndexUpdate(changed, "")
+	if len(changed) == 0 {
+		e.logger.Debug("filesystem event scanned; no content or metadata changes to sync", "paths", paths)
+		return
 	}
+	for _, fi := range changed {
+		e.logger.Info("local file change indexed",
+			"path", fi.Path,
+			"type", fi.Type.String(),
+			"size", fi.Size,
+			"deleted", fi.Deleted,
+			"blocks", len(fi.Blocks),
+			"version", fi.Version,
+		)
+	}
+	e.logger.Debug("broadcasting local filesystem updates", "count", len(changed))
+	e.broadcastIndexUpdate(changed, "")
 }
 
 func (e *Engine) rescanLoop() {
@@ -652,8 +683,22 @@ func (e *Engine) rescanLoop() {
 				continue
 			}
 			if len(changed) > 0 {
+				for _, fi := range changed {
+					e.logger.Info("periodic rescan detected local change",
+						"path", fi.Path,
+						"type", fi.Type.String(),
+						"size", fi.Size,
+						"deleted", fi.Deleted,
+						"version", fi.Version,
+					)
+				}
 				e.logger.Debug("periodic rescan detected changes", "count", len(changed))
 				e.broadcastIndexUpdate(changed, "")
+			} else {
+				e.logger.Debug("periodic rescan completed with no changes",
+					"connected_peers", e.PeerCount(),
+					"tracked_files", len(e.store.ListFiles()),
+				)
 			}
 		}
 	}
@@ -689,6 +734,8 @@ func (e *Engine) onPeerDiscovered(addr string, source string) {
 	if !e.beginDial(addr) {
 		return
 	}
+
+	e.logger.Debug("dialing discovered peer", "addr", addr, "source", source)
 
 	e.wg.Add(1)
 	go func() {
@@ -784,6 +831,17 @@ func (e *Engine) handleConn(rawConn net.Conn, isOutbound bool, dialedAddr string
 			e.peersMu.Lock()
 			e.selfAddrs[dialedAddr] = true
 			e.peersMu.Unlock()
+		} else {
+			remoteStr := ""
+			if rawConn.RemoteAddr() != nil {
+				remoteStr = rawConn.RemoteAddr().String()
+			}
+			e.logger.Debug("peer handshake failed",
+				"remote_addr", remoteStr,
+				"dialed_addr", dialedAddr,
+				"is_outbound", isOutbound,
+				"err", err,
+			)
 		}
 		return
 	}
@@ -855,6 +913,10 @@ func (e *Engine) handleConn(rawConn net.Conn, isOutbound bool, dialedAddr string
 
 	// Send initial full IndexExchange (excluding any locally ignored paths).
 	localFiles := e.localIndexForPeer()
+	e.logger.Debug("sending initial IndexExchange to peer",
+		"remote_node_id", remoteNodeID,
+		"entries", len(localFiles),
+	)
 	if err := session.conn.SendIndexExchange(localFiles); err != nil {
 		e.logger.Debug("failed to send initial IndexExchange",
 			"remote_node_id", remoteNodeID,
@@ -938,9 +1000,21 @@ func (e *Engine) broadcastIndexUpdate(files []model.FileInfo, excludeNodeID stri
 			sessions = append(sessions, s)
 		}
 	}
+	totalPeers := len(e.peers)
 	e.peersMu.RUnlock()
 
+	if len(sessions) == 0 && excludeNodeID == "" && totalPeers == 0 {
+		e.logger.Warn("local file change indexed while 0 peers are connected; will sync automatically when a peer connects",
+			"changed_files", len(filtered),
+		)
+		return
+	}
+
 	for _, s := range sessions {
+		e.logger.Debug("sending IndexUpdate to peer",
+			"remote_node_id", s.NodeID(),
+			"entries", len(filtered),
+		)
 		if err := s.conn.SendIndexUpdate(filtered); err != nil {
 			e.logger.Debug("failed to send IndexUpdate to peer",
 				"remote_node_id", s.NodeID(),
@@ -1140,6 +1214,13 @@ func (e *Engine) reconcileSingleFile(
 		if err := e.writer.ApplyRemoteFile(ctx, remoteFI, e.fetchBlockWithFallback(session)); err != nil {
 			return nil, nil, err
 		}
+		e.logger.Info("synced new entry from peer",
+			"path", remoteFI.Path,
+			"type", remoteFI.Type.String(),
+			"size", remoteFI.Size,
+			"from_peer", session.NodeID(),
+			"version", remoteFI.Version,
+		)
 		return []model.FileInfo{remoteFI}, nil, nil
 	}
 
@@ -1166,6 +1247,14 @@ func (e *Engine) reconcileSingleFile(
 		if err := e.writer.ApplyRemoteFile(ctx, remoteFI, e.fetchBlockWithFallback(session)); err != nil {
 			return nil, nil, err
 		}
+		e.logger.Info("synced updated entry from peer",
+			"path", remoteFI.Path,
+			"type", remoteFI.Type.String(),
+			"size", remoteFI.Size,
+			"deleted", remoteFI.Deleted,
+			"from_peer", session.NodeID(),
+			"version", remoteFI.Version,
+		)
 		return []model.FileInfo{remoteFI}, nil, nil
 
 	case model.CmpConcurrent:

@@ -106,11 +106,13 @@ func (d *DNSDiscoverer) PollOnce(ctx context.Context) []string {
 			continue
 		}
 
+		var resolvedIPs []string
 		for _, ipAddr := range addrs {
 			if ipAddr.IP == nil {
 				continue
 			}
 			ipStr := ipAddr.IP.String()
+			resolvedIPs = append(resolvedIPs, ipStr)
 			// Filter out local interface IPs when targeting our own listen port.
 			if port == d.localListenPort && localIPs[ipStr] {
 				continue
@@ -126,6 +128,11 @@ func (d *DNSDiscoverer) PollOnce(ctx context.Context) []string {
 				d.onPeer(endpoint, SourceDNS)
 			}
 		}
+		d.logger.Debug("dns discovery lookup succeeded",
+			"host", host,
+			"resolved_ips", resolvedIPs,
+			"remote_endpoints", discovered,
+		)
 	}
 
 	return discovered
@@ -137,6 +144,12 @@ func (d *DNSDiscoverer) Run(ctx context.Context) error {
 		<-ctx.Done()
 		return nil
 	}
+
+	d.logger.Info("DNS peer discovery started",
+		"dns_names", d.dnsNames,
+		"default_port", d.defaultPort,
+		"interval", d.interval.String(),
+	)
 
 	d.PollOnce(ctx)
 

@@ -257,6 +257,12 @@ func (l *LANDiscoverer) Run(ctx context.Context) error {
 	}
 	defer pc.Close()
 
+	l.logger.Info("LAN UDP discovery listener started",
+		"bind_addr", bindAddr,
+		"announce_listen_port", l.listenPort,
+		"interval", l.interval.String(),
+	)
+
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
@@ -295,6 +301,12 @@ func (l *LANDiscoverer) readLoop(ctx context.Context, pc net.PacketConn) {
 
 		beacon, err := VerifyBeacon(buf[:n], l.nodeID, l.secret, time.Now(), l.maxAge)
 		if err != nil {
+			if !errors.Is(err, ErrSelfBeacon) {
+				l.logger.Debug("ignoring LAN beacon",
+					"sender_addr", srcAddr.String(),
+					"err", err,
+				)
+			}
 			continue
 		}
 
@@ -304,6 +316,10 @@ func (l *LANDiscoverer) readLoop(ctx context.Context, pc net.PacketConn) {
 		}
 
 		endpoint := net.JoinHostPort(senderIP, strconv.Itoa(int(beacon.ListenPort)))
+		l.logger.Debug("received valid LAN discovery beacon",
+			"remote_node_id", beacon.NodeID,
+			"endpoint", endpoint,
+		)
 		if l.onPeer != nil {
 			l.onPeer(endpoint, SourceLAN)
 		}
