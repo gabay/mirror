@@ -383,6 +383,8 @@ func (w *Watcher) debounceLoop() {
 	defer w.wg.Done()
 
 	pending := make(map[string]struct{})
+	var batchStart time.Time
+	maxWait := max(4*w.debounceDelay, 2*time.Second)
 	var timer *time.Timer
 	var timerCh <-chan time.Time
 
@@ -407,6 +409,7 @@ func (w *Watcher) debounceLoop() {
 			paths = append(paths, p)
 		}
 		clear(pending)
+		batchStart = time.Time{}
 		sort.Strings(paths)
 
 		w.logger.Debug("watcher flushing debounced changes", "paths", paths)
@@ -422,9 +425,25 @@ func (w *Watcher) debounceLoop() {
 			return
 
 		case p := <-w.eventCh:
+			now := time.Now()
+			if len(pending) == 0 {
+				batchStart = now
+			}
 			pending[p] = struct{}{}
+
+			elapsed := now.Sub(batchStart)
+			if elapsed >= maxWait {
+				stopTimer()
+				flush()
+				continue
+			}
+
+			waitDur := w.debounceDelay
+			if rem := maxWait - elapsed; rem < waitDur {
+				waitDur = rem
+			}
 			if timer == nil {
-				timer = time.NewTimer(w.debounceDelay)
+				timer = time.NewTimer(waitDur)
 			} else {
 				if !timer.Stop() {
 					select {
@@ -432,7 +451,7 @@ func (w *Watcher) debounceLoop() {
 					default:
 					}
 				}
-				timer.Reset(w.debounceDelay)
+				timer.Reset(waitDur)
 			}
 			timerCh = timer.C
 

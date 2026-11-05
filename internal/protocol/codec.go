@@ -31,6 +31,7 @@ type Conn struct {
 	writeMu      sync.Mutex
 	readMu       sync.Mutex
 	maxFrameSize uint32
+	writeTimeout time.Duration
 }
 
 // NewConn wraps an existing net.Conn (typically a *tls.Conn) with framed duplex messaging.
@@ -45,6 +46,14 @@ func NewConn(conn net.Conn) *Conn {
 func (c *Conn) WithMaxFrameSize(maxBytes uint32) *Conn {
 	if maxBytes > 0 {
 		c.maxFrameSize = maxBytes
+	}
+	return c
+}
+
+// WithWriteTimeout sets a per-frame write timeout on the connection so stalled sockets cannot block indefinitely.
+func (c *Conn) WithWriteTimeout(d time.Duration) *Conn {
+	if d >= 0 {
+		c.writeTimeout = d
 	}
 	return c
 }
@@ -98,6 +107,13 @@ func (c *Conn) WriteFrame(msgType MsgType, payload []byte) error {
 
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+
+	if c.writeTimeout > 0 {
+		_ = c.conn.SetWriteDeadline(time.Now().Add(c.writeTimeout))
+		defer func() {
+			_ = c.conn.SetWriteDeadline(time.Time{})
+		}()
+	}
 
 	return writeFull(c.conn, frame)
 }

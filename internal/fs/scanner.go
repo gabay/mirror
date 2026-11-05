@@ -201,14 +201,14 @@ func (s *Scanner) ScanPaths(relPaths []string) ([]model.FileInfo, error) {
 	var changed []model.FileInfo
 
 	for _, raw := range relPaths {
-		norm := normalizeRelPath(raw)
-		if norm == "." {
+		if strings.TrimSpace(raw) == "." {
 			// Full rescan requested (e.g., queue overflow).
 			s.mu.Unlock()
 			allChanged, err := s.ScanAll()
 			s.mu.Lock()
 			return allChanged, err
 		}
+		norm := normalizeRelPath(raw)
 		if norm == "" {
 			continue
 		}
@@ -285,6 +285,22 @@ func (s *Scanner) ScanPaths(relPaths []string) ([]model.FileInfo, error) {
 			})
 			if walkErr != nil {
 				return nil, walkErr
+			}
+			// Also check if any tracked descendants under norm/ were deleted.
+			prefix := norm + "/"
+			for _, tracked := range s.store.ListFiles() {
+				if tracked.Deleted || !strings.HasPrefix(tracked.Path, prefix) {
+					continue
+				}
+				if _, done := visited[tracked.Path]; done {
+					continue
+				}
+				visited[tracked.Path] = struct{}{}
+				if fi, updated, err := s.scanSinglePathLocked(tracked.Path); err != nil {
+					return nil, err
+				} else if updated && fi != nil {
+					changed = append(changed, *fi)
+				}
 			}
 			continue
 		}

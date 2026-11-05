@@ -305,25 +305,48 @@ func (w *Writer) applyRegularFile(
 	fi model.FileInfo,
 	fetchBlock FetchBlockFunc,
 ) error {
+	stagingPath, err := w.StageRegularFile(ctx, fi, fetchBlock)
+	if err != nil {
+		return err
+	}
+	return w.CommitStagedRegularFile(stagingPath, fi)
+}
+
+// StageRegularFile downloads or reuses blocks for a regular file into a hidden staging file,
+// verifies its total size and full-file BLAKE3 digest, and applies its file metadata.
+// The caller must subsequently call CommitStagedRegularFile or remove the returned stagingPath.
+func (w *Writer) StageRegularFile(
+	ctx context.Context,
+	fi model.FileInfo,
+	fetchBlock FetchBlockFunc,
+) (string, error) {
+	norm := normalizeRelPath(fi.Path)
+	if norm == "" {
+		return "", store.ErrEmptyPath
+	}
+	fi = fi.Clone()
+	fi.Path = norm
+
+	absPath := filepath.Join(w.rootDir, filepath.FromSlash(norm))
 	parentDir := filepath.Dir(absPath)
 	if err := os.MkdirAll(parentDir, 0o755); err != nil {
-		return fmt.Errorf("writer: mkdir parent for file %q: %w", absPath, err)
+		return "", fmt.Errorf("writer: mkdir parent for file %q: %w", absPath, err)
 	}
 
 	stagingPath, err := makeStagingPath(absPath)
 	if err != nil {
-		return err
+		return "", err
 	}
-	renamed := false
+	stagedOK := false
 	defer func() {
-		if !renamed {
+		if !stagedOK {
 			_ = os.Remove(stagingPath)
 		}
 	}()
 
 	stagingFile, err := os.OpenFile(stagingPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o600)
 	if err != nil {
-		return fmt.Errorf("writer: create staging file %q: %w", stagingPath, err)
+		return "", fmt.Errorf("writer: create staging file %q: %w", stagingPath, err)
 	}
 	defer func() {
 		if stagingFile != nil {
@@ -335,10 +358,10 @@ func (w *Writer) applyRegularFile(
 
 	for _, block := range fi.Blocks {
 		if err := ctx.Err(); err != nil {
-			return err
+			return "", err
 		}
 		if block.Size < 0 || block.Offset < 0 {
-			return fmt.Errorf("writer: invalid block bounds (offset=%d, size=%d) for %q",
+			return "", fmt.Errorf("writer: invalid block bounds (offset=%d, size=%d) for %q",
 				block.Offset, block.Size, fi.Path)
 		}
 
@@ -364,28 +387,28 @@ func (w *Writer) applyRegularFile(
 		// 3. Fetch missing block from remote peer.
 		if !ok {
 			if fetchBlock == nil {
-				return fmt.Errorf("writer: missing local block %x for %q and fetchBlock is nil",
+				return "", fmt.Errorf("writer: missing local block %x for %q and fetchBlock is nil",
 					block.Hash[:4], fi.Path)
 			}
 			fetched, err := fetchBlock(ctx, block.Hash, block.Size)
 			if err != nil {
-				return fmt.Errorf("writer: fetch block %x (index %d) for %q: %w",
+				return "", fmt.Errorf("writer: fetch block %x (index %d) for %q: %w",
 					block.Hash[:4], block.Index, fi.Path, err)
 			}
 			if int32(len(fetched)) != block.Size {
-				return fmt.Errorf("writer: block %x size mismatch: got %d, want %d",
+				return "", fmt.Errorf("writer: block %x size mismatch: got %d, want %d",
 					block.Hash[:4], len(fetched), block.Size)
 			}
 			actualHash := chunker.HashBytes(fetched)
 			if actualHash != block.Hash {
-				return fmt.Errorf("writer: block %x hash mismatch: got %x",
+				return "", fmt.Errorf("writer: block %x hash mismatch: got %x",
 					block.Hash[:8], actualHash[:8])
 			}
 			data = fetched
 		}
 
 		if _, err := stagingFile.WriteAt(data, block.Offset); err != nil {
-			return fmt.Errorf("writer: write block %d at offset %d in %q: %w",
+			return "", fmt.Errorf("writer: write block %d at offset %d in %q: %w",
 				block.Index, block.Offset, stagingPath, err)
 		}
 		writtenInStaging[block.Hash] = block.Offset
@@ -393,32 +416,54 @@ func (w *Writer) applyRegularFile(
 
 	// Verify total size and full-file BLAKE3 hash of the assembled staging file.
 	if _, err := stagingFile.Seek(0, io.SeekStart); err != nil {
-		return fmt.Errorf("writer: seek staging file %q: %w", stagingPath, err)
+		return "", fmt.Errorf("writer: seek staging file %q: %w", stagingPath, err)
 	}
 	_, computedFileHash, totalSize, err := chunker.ChunkReader(stagingFile)
 	if err != nil {
-		return fmt.Errorf("writer: verify assembled file %q: %w", stagingPath, err)
+		return "", fmt.Errorf("writer: verify assembled file %q: %w", stagingPath, err)
 	}
 	if totalSize != fi.Size {
-		return fmt.Errorf("writer: assembled file %q size mismatch: got %d, want %d",
+		return "", fmt.Errorf("writer: assembled file %q size mismatch: got %d, want %d",
 			fi.Path, totalSize, fi.Size)
 	}
 	if computedFileHash != fi.FileHash {
-		return fmt.Errorf("writer: assembled file %q hash mismatch: got %x, want %x",
+		return "", fmt.Errorf("writer: assembled file %q hash mismatch: got %x, want %x",
 			fi.Path, computedFileHash[:8], fi.FileHash[:8])
 	}
 
 	if err := stagingFile.Sync(); err != nil {
-		return fmt.Errorf("writer: sync staging file %q: %w", stagingPath, err)
+		return "", fmt.Errorf("writer: sync staging file %q: %w", stagingPath, err)
 	}
 	if err := stagingFile.Close(); err != nil {
-		return fmt.Errorf("writer: close staging file %q: %w", stagingPath, err)
+		return "", fmt.Errorf("writer: close staging file %q: %w", stagingPath, err)
 	}
 	stagingFile = nil
 
 	if err := ApplyMetadata(stagingPath, fi, w.logger); err != nil {
-		return err
+		return "", err
 	}
+
+	stagedOK = true
+	return stagingPath, nil
+}
+
+// CommitStagedRegularFile records fi in Store and atomically renames stagingPath to its target path.
+// If committing fails, stagingPath is removed automatically.
+func (w *Writer) CommitStagedRegularFile(stagingPath string, fi model.FileInfo) error {
+	renamed := false
+	defer func() {
+		if !renamed {
+			_ = os.Remove(stagingPath)
+		}
+	}()
+
+	norm := normalizeRelPath(fi.Path)
+	if norm == "" {
+		return store.ErrEmptyPath
+	}
+	fi = fi.Clone()
+	fi.Path = norm
+	absPath := filepath.Join(w.rootDir, filepath.FromSlash(norm))
 
 	if info, err := os.Lstat(absPath); err == nil && info.IsDir() {
 		if err := os.RemoveAll(absPath); err != nil {

@@ -9,9 +9,9 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -828,14 +828,28 @@ func TestEngine_ExclusionsAndSpecialFileFIFO(t *testing.T) {
 }
 
 type staticDNSResolver struct {
+	mu      sync.RWMutex
 	records map[string][]net.IPAddr
 }
 
 func (r *staticDNSResolver) LookupIPAddr(_ context.Context, host string) ([]net.IPAddr, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	if ips, ok := r.records[host]; ok {
-		return ips, nil
+		out := make([]net.IPAddr, len(ips))
+		copy(out, ips)
+		return out, nil
 	}
 	return nil, fmt.Errorf("host not found: %s", host)
+}
+
+func (r *staticDNSResolver) SetRecords(host string, ips []net.IPAddr) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.records == nil {
+		r.records = make(map[string][]net.IPAddr)
+	}
+	r.records[host] = ips
 }
 
 func freeTestUDPPort(t *testing.T) int {
@@ -928,7 +942,6 @@ func TestEngine_LANDiscoveryAndSwarmDNSDiscoveryIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("SplitHostPort: %v", err)
 		}
-		port1, _ := strconv.Atoi(portStr)
 
 		resolver := &staticDNSResolver{
 			records: map[string][]net.IPAddr{
@@ -952,7 +965,7 @@ func TestEngine_LANDiscoveryAndSwarmDNSDiscoveryIntegration(t *testing.T) {
 			NodeID:           "swarm-node-2",
 			ListenAddr:       "127.0.0.1:0",
 			Secret:           "swarm-secret",
-			DiscoveryDNS:     []string{fmt.Sprintf("tasks.mirror:%d", port1)},
+			DiscoveryDNS:     []string{fmt.Sprintf("tasks.mirror:%s", portStr)},
 			DiscoveryLAN:     false,
 			DiscoveryPort:    22002,
 			ConflictStrategy: config.ConflictLWW,
@@ -984,5 +997,323 @@ func TestEngine_LANDiscoveryAndSwarmDNSDiscoveryIntegration(t *testing.T) {
 			got, err := os.ReadFile(filepath.Join(node2.dataDir, "swarm-task.txt"))
 			return err == nil && string(got) == "hello from tasks.mirror"
 		})
+	})
+}
+
+// blackholeTCPProxy forwards TCP connections to a backend address and allows blackholing
+// active connections (dropping all subsequent bytes without sending TCP FIN/RST) to simulate
+// half-open Docker Swarm overlay network connections.
+type blackholeTCPProxy struct {
+	ln          net.Listener
+	targetAddr  atomic.Value
+	blackholed  atomic.Bool
+	mu          sync.Mutex
+	clientConns []net.Conn
+	serverConns []net.Conn
+}
+
+func newBlackholeTCPProxy(t *testing.T, listenAddr string, initialTarget string) *blackholeTCPProxy {
+	t.Helper()
+	ln, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		t.Fatalf("newBlackholeTCPProxy listen %s: %v", listenAddr, err)
+	}
+	p := &blackholeTCPProxy{ln: ln}
+	p.targetAddr.Store(initialTarget)
+
+	go p.acceptLoop()
+	return p
+}
+
+func (p *blackholeTCPProxy) Addr() string {
+	return p.ln.Addr().String()
+}
+
+func (p *blackholeTCPProxy) SetBlackhole(enabled bool) {
+	p.blackholed.Store(enabled)
+}
+
+// SeverBackendOnly closes the backend side while keeping the client side open & blackholed,
+// creating a true half-open socket on the client (no FIN/RST delivered to client).
+func (p *blackholeTCPProxy) SeverBackendOnly() {
+	p.blackholed.Store(true)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, sc := range p.serverConns {
+		_ = sc.Close()
+	}
+	p.serverConns = nil
+}
+
+func (p *blackholeTCPProxy) Close() {
+	_ = p.ln.Close()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, c := range p.clientConns {
+		_ = c.Close()
+	}
+	for _, s := range p.serverConns {
+		_ = s.Close()
+	}
+}
+
+func (p *blackholeTCPProxy) acceptLoop() {
+	for {
+		cConn, err := p.ln.Accept()
+		if err != nil {
+			return
+		}
+		if p.blackholed.Load() {
+			// Accept and hold open silently when blackholed.
+			p.mu.Lock()
+			p.clientConns = append(p.clientConns, cConn)
+			p.mu.Unlock()
+			continue
+		}
+		target := p.targetAddr.Load().(string)
+		sConn, err := net.DialTimeout("tcp", target, 2*time.Second)
+		if err != nil {
+			_ = cConn.Close()
+			continue
+		}
+		p.mu.Lock()
+		p.clientConns = append(p.clientConns, cConn)
+		p.serverConns = append(p.serverConns, sConn)
+		p.mu.Unlock()
+
+		go p.pipe(cConn, sConn)
+		go p.pipe(sConn, cConn)
+	}
+}
+
+func (p *blackholeTCPProxy) pipe(dst, src net.Conn) {
+	buf := make([]byte, 32*1024)
+	for {
+		n, err := src.Read(buf)
+		if n > 0 && !p.blackholed.Load() {
+			if _, wErr := dst.Write(buf[:n]); wErr != nil {
+				return
+			}
+		}
+		if err != nil {
+			if !p.blackholed.Load() {
+				_ = dst.Close()
+			}
+			return
+		}
+	}
+}
+
+func TestEngine_SwarmDNS_HalfOpenCanonicalSessionAndContainerRestartE2E(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	// Allocate a shared Swarm listen port on distinct loopback IPs (127.0.0.2, 127.0.0.3, 127.0.0.4)
+	// to faithfully model Docker Swarm containers on an overlay network discovered via tasks.mirror.
+	probeLn, err := net.Listen("tcp", "127.0.0.2:0")
+	if err != nil {
+		t.Fatalf("listen 127.0.0.2: %v", err)
+	}
+	swarmPort := probeLn.Addr().(*net.TCPAddr).Port
+	_ = probeLn.Close()
+
+	dnsEntry := fmt.Sprintf("tasks.mirror:%d", swarmPort)
+	resolver := &staticDNSResolver{}
+	resolver.SetRecords("tasks.mirror", []net.IPAddr{
+		{IP: net.ParseIP("127.0.0.2")}, // Node 1 (smaller NodeID: "1111-node-alpha")
+		{IP: net.ParseIP("127.0.0.3")}, // Proxy to Node 2's initial container
+	})
+
+	createSwarmNode := func(nodeID, bindIP, dataDir, stateDir string) *testNode {
+		st, err := store.Open(stateDir)
+		if err != nil {
+			t.Fatalf("store.Open: %v", err)
+		}
+		logBuf := &safeLogBuffer{}
+		logger := slog.New(slog.NewTextHandler(logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+		cfg := config.Config{
+			Path:             dataDir,
+			StateDir:         stateDir,
+			NodeID:           nodeID,
+			ListenAddr:       fmt.Sprintf("%s:%d", bindIP, swarmPort),
+			Secret:           "swarm-e2e-secret",
+			DiscoveryDNS:     []string{dnsEntry},
+			DiscoveryLAN:     false,
+			DiscoveryPort:    22002,
+			ConflictStrategy: config.ConflictLWW,
+			RescanInterval:   2 * time.Second,
+			DebounceDelay:    50 * time.Millisecond,
+			LogLevel:         "debug",
+		}
+		eng, err := NewEngine(cfg, st, logger)
+		if err != nil {
+			_ = st.Close()
+			t.Fatalf("NewEngine: %v", err)
+		}
+		eng.WithResolver(resolver).
+			WithDiscoveryInterval(100 * time.Millisecond).
+			WithPingInterval(250 * time.Millisecond).
+			WithProbeTimeout(150 * time.Millisecond)
+
+		return &testNode{
+			t:        t,
+			nodeID:   nodeID,
+			dataDir:  dataDir,
+			stateDir: stateDir,
+			store:    st,
+			engine:   eng,
+			logs:     logBuf,
+		}
+	}
+
+	// Node 1 has smaller NodeID ("1111-node-alpha"), so outbound connections from Node 1 -> Node 2
+	// are canonical (isCanonical = true).
+	node1 := createSwarmNode("1111-node-alpha", "127.0.0.2", t.TempDir(), t.TempDir())
+	defer node1.close()
+
+	// Node 2 has larger NodeID ("9999-node-omega"). Bind Node 2's first container on 127.0.0.13
+	// and front it with a blackhole proxy at 127.0.0.3:<swarmPort> so we can leave Node 1's
+	// outbound canonical socket half-open when Node 2 restarts on a new overlay IP (127.0.0.4).
+	node2DataDir := t.TempDir()
+	node2StateDir := t.TempDir()
+	node2v1 := createSwarmNode("9999-node-omega", "127.0.0.13", node2DataDir, node2StateDir)
+	proxy := newBlackholeTCPProxy(t, fmt.Sprintf("127.0.0.3:%d", swarmPort), fmt.Sprintf("127.0.0.13:%d", swarmPort))
+	defer proxy.Close()
+
+	node1.start(ctx)
+	node2v1.start(ctx)
+
+	// Phase 1: Verify initial Swarm DNS discovery and live watcher sync in both directions.
+	if err := os.WriteFile(filepath.Join(node1.dataDir, "phase1-from-1.txt"), []byte("phase1-ok"), 0o644); err != nil {
+		t.Fatalf("write phase1-from-1.txt: %v", err)
+	}
+	waitForCondition(t, 5*time.Second, "phase 1 live sync from node1 to node2v1", func() bool {
+		got, err := os.ReadFile(filepath.Join(node2DataDir, "phase1-from-1.txt"))
+		return err == nil && string(got) == "phase1-ok"
+	})
+
+	// Phase 2: Simulate Docker Swarm container restart / reschedule of Node 2 onto a new overlay IP (127.0.0.4)
+	// while Node 1's old TCP connection to 127.0.0.3 remains half-open (blackholed in overlay network, no FIN/RST).
+	proxy.SeverBackendOnly()
+	node2v1.close()
+
+	// Update Swarm DNS tasks.mirror to point to Node 2's new container IP 127.0.0.4.
+	resolver.SetRecords("tasks.mirror", []net.IPAddr{
+		{IP: net.ParseIP("127.0.0.2")},
+		{IP: net.ParseIP("127.0.0.4")},
+	})
+
+	// Start Node 2's new container with the same persisted stateDir & dataDir (same NodeID "9999-node-omega").
+	node2v2 := createSwarmNode("9999-node-omega", "127.0.0.4", node2DataDir, node2StateDir)
+	defer node2v2.close()
+	node2v2.start(ctx)
+
+	// Write new files on BOTH Node 1 and Node 2 and verify the watcher detects and syncs them across.
+	if err := os.WriteFile(filepath.Join(node2DataDir, "after-restart-from-2.txt"), []byte("synced-from-restarted-node2"), 0o644); err != nil {
+		t.Fatalf("write after-restart-from-2.txt: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(node1.dataDir, "after-restart-from-1.txt"), []byte("synced-from-surviving-node1"), 0o644); err != nil {
+		t.Fatalf("write after-restart-from-1.txt: %v", err)
+	}
+
+	waitForCondition(t, 6*time.Second, "bidirectional live sync recovers after half-open canonical session and Swarm IP change", func() bool {
+		gotFrom2, err1 := os.ReadFile(filepath.Join(node1.dataDir, "after-restart-from-2.txt"))
+		gotFrom1, err2 := os.ReadFile(filepath.Join(node2DataDir, "after-restart-from-1.txt"))
+		return err1 == nil && string(gotFrom2) == "synced-from-restarted-node2" &&
+			err2 == nil && string(gotFrom1) == "synced-from-surviving-node1"
+	})
+
+	// Phase 3: Simulate silent overlay network blackhole where NEITHER container restarts
+	// (no FIN/RST on either side), files are modified while the connection is dead, and then
+	// the overlay network heals. Heartbeat ping/read deadlines must evict the dead session
+	// and DNS discovery must re-establish sync automatically.
+	proxy2 := newBlackholeTCPProxy(t, fmt.Sprintf("127.0.0.5:%d", swarmPort), fmt.Sprintf("127.0.0.4:%d", swarmPort))
+	defer proxy2.Close()
+
+	// Route Node 1 -> Node 2 via proxy2 (127.0.0.5) and blackhole it after connection is active.
+	resolver.SetRecords("tasks.mirror", []net.IPAddr{
+		{IP: net.ParseIP("127.0.0.2")},
+		{IP: net.ParseIP("127.0.0.5")},
+	})
+
+	// Silently blackhole all traffic through proxy2 and sever backend to force reconnect through proxy2.
+	proxy2.SetBlackhole(true)
+	// Also close current active session's underlying net.Conn on node2v2 side or wait for blackhole:
+	// To simulate an overlay conntrack drop between node1 and node2v2, blackhole proxy2, force
+	// the switchover to proxy2, then un-blackhole proxy2 and verify automatic recovery.
+	node2v2.engine.peersMu.RLock()
+	for _, s := range node2v2.engine.peers {
+		_ = s.Close()
+	}
+	node2v2.engine.peersMu.RUnlock()
+
+	// While proxy2 is blackholed, write a file on node1 (watcher indexes it while peer is unreachable).
+	if err := os.WriteFile(filepath.Join(node1.dataDir, "during-blackhole.txt"), []byte("healed-after-blackhole"), 0o644); err != nil {
+		t.Fatalf("write during-blackhole.txt: %v", err)
+	}
+
+	// Heal the overlay network proxy.
+	proxy2.SetBlackhole(false)
+
+	waitForCondition(t, 6*time.Second, "sync automatically recovers after silent overlay blackhole heals", func() bool {
+		got, err := os.ReadFile(filepath.Join(node2DataDir, "during-blackhole.txt"))
+		return err == nil && string(got) == "healed-after-blackhole"
+	})
+}
+
+func TestEngine_LargeIndexExchange_NoFullDuplexDeadlock(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	nodeA := newTestNode(t, "node-large-a", "large-idx-secret", config.ConflictLWW, nil, nil)
+	defer nodeA.close()
+
+	nodeB := newTestNode(t, "node-large-b", "large-idx-secret", config.ConflictLWW, nil, nil)
+	defer nodeB.close()
+
+	// Pre-populate 300 files on each node (> maxFilesPerIndexBatch = 256) so both nodes
+	// send multi-batch IndexExchange frames simultaneously upon connecting.
+	const filesPerNode = 300
+	for i := range filesPerNode {
+		nameA := fmt.Sprintf("dir-a/file-%04d.txt", i)
+		absA := filepath.Join(nodeA.dataDir, filepath.FromSlash(nameA))
+		if err := os.MkdirAll(filepath.Dir(absA), 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.WriteFile(absA, []byte(fmt.Sprintf("content-a-%d", i)), 0o644); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+
+		nameB := fmt.Sprintf("dir-b/file-%04d.txt", i)
+		absB := filepath.Join(nodeB.dataDir, filepath.FromSlash(nameB))
+		if err := os.MkdirAll(filepath.Dir(absB), 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.WriteFile(absB, []byte(fmt.Sprintf("content-b-%d", i)), 0o644); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+
+	nodeA.start(ctx)
+	nodeB.start(ctx)
+
+	if err := nodeA.engine.DialPeer(ctx, nodeB.engine.ListenAddr()); err != nil {
+		t.Fatalf("DialPeer: %v", err)
+	}
+
+	waitForCondition(t, 10*time.Second, "both nodes exchange 300+ files without deadlocking", func() bool {
+		gotBOnA, err1 := os.ReadFile(filepath.Join(nodeA.dataDir, "dir-b", "file-0299.txt"))
+		gotAOnB, err2 := os.ReadFile(filepath.Join(nodeB.dataDir, "dir-a", "file-0299.txt"))
+		return err1 == nil && string(gotBOnA) == "content-b-299" &&
+			err2 == nil && string(gotAOnB) == "content-a-299"
+	})
+
+	// Verify live watcher change immediately propagates after large index exchange.
+	if err := os.WriteFile(filepath.Join(nodeA.dataDir, "live-after-large.txt"), []byte("live-ok"), 0o644); err != nil {
+		t.Fatalf("write live-after-large.txt: %v", err)
+	}
+	waitForCondition(t, 5*time.Second, "live watcher change propagates after large index exchange", func() bool {
+		got, err := os.ReadFile(filepath.Join(nodeB.dataDir, "live-after-large.txt"))
+		return err == nil && string(got) == "live-ok"
 	})
 }

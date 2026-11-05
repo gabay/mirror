@@ -29,9 +29,15 @@ import (
 
 const (
 	defaultDialTimeout         = 5 * time.Second
+	defaultWriteTimeout        = 15 * time.Second
+	defaultTCPKeepAlive        = 30 * time.Second
+	defaultPingInterval        = 30 * time.Second
+	defaultProbeTimeout        = 2 * time.Second
 	defaultBlockRequestTimeout = 30 * time.Second
-	defaultDiscoveryPoll       = 5 * time.Second
+	defaultDiscoveryInterval   = 60 * time.Second
 	maxConcurrentBlockServes   = 64
+	maxFilesPerIndexBatch      = 256
+	maxBlocksPerIndexBatch     = 16384
 )
 
 // PeerSession represents an active authenticated TLS 1.3 session with a remote peer.
@@ -48,6 +54,11 @@ type PeerSession struct {
 	reqMu       sync.Mutex
 	pendingReqs map[uint64]chan protocol.BlockResponse
 
+	lastSeenNs      atomic.Int64
+	activityMu      sync.Mutex
+	nextActivityID  atomic.Uint64
+	activityWaiters map[uint64]chan struct{}
+
 	closed    atomic.Bool
 	closeOnce sync.Once
 	doneCh    chan struct{}
@@ -62,17 +73,20 @@ func newPeerSession(
 	dialedAddr string,
 	peerListenAddr string,
 ) *PeerSession {
-	return &PeerSession{
-		engine:         engine,
-		conn:           conn,
-		peerInfo:       peerInfo,
-		isOutbound:     isOutbound,
-		isCanonical:    isCanonical,
-		dialedAddr:     dialedAddr,
-		peerListenAddr: peerListenAddr,
-		pendingReqs:    make(map[uint64]chan protocol.BlockResponse),
-		doneCh:         make(chan struct{}),
+	s := &PeerSession{
+		engine:          engine,
+		conn:            conn,
+		peerInfo:        peerInfo,
+		isOutbound:      isOutbound,
+		isCanonical:     isCanonical,
+		dialedAddr:      dialedAddr,
+		peerListenAddr:  peerListenAddr,
+		pendingReqs:     make(map[uint64]chan protocol.BlockResponse),
+		activityWaiters: make(map[uint64]chan struct{}),
+		doneCh:          make(chan struct{}),
 	}
+	s.lastSeenNs.Store(time.Now().UnixNano())
+	return s
 }
 
 // NodeID returns the remote peer's NodeID.
@@ -109,8 +123,134 @@ func (s *PeerSession) Close() error {
 			delete(s.pendingReqs, id)
 		}
 		s.reqMu.Unlock()
+
+		s.activityMu.Lock()
+		for id, ch := range s.activityWaiters {
+			close(ch)
+			delete(s.activityWaiters, id)
+		}
+		s.activityMu.Unlock()
 	})
 	return closeErr
+}
+
+func (s *PeerSession) notifyActivity() {
+	s.lastSeenNs.Store(time.Now().UnixNano())
+	s.activityMu.Lock()
+	for id, ch := range s.activityWaiters {
+		close(ch)
+		delete(s.activityWaiters, id)
+	}
+	s.activityMu.Unlock()
+}
+
+// Probe actively verifies that the remote peer session is responsive by sending a Ping
+// and waiting up to timeout for any frame (such as Pong) to be received from the peer.
+func (s *PeerSession) Probe(ctx context.Context, timeout time.Duration) bool {
+	if s.isClosed() {
+		return false
+	}
+	if timeout <= 0 {
+		timeout = defaultProbeTimeout
+	}
+
+	waitID := s.nextActivityID.Add(1)
+	waitCh := make(chan struct{})
+
+	s.activityMu.Lock()
+	if s.isClosed() {
+		s.activityMu.Unlock()
+		return false
+	}
+	s.activityWaiters[waitID] = waitCh
+	s.activityMu.Unlock()
+
+	defer func() {
+		s.activityMu.Lock()
+		delete(s.activityWaiters, waitID)
+		s.activityMu.Unlock()
+	}()
+
+	sendErrCh := make(chan error, 1)
+	go func() {
+		sendErrCh <- s.conn.SendPing(time.Now().UnixNano())
+	}()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case err := <-sendErrCh:
+		if err != nil {
+			_ = s.Close()
+			return false
+		}
+	case <-waitCh:
+		return !s.isClosed()
+	case <-s.doneCh:
+		return false
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return false
+	}
+
+	select {
+	case <-waitCh:
+		return !s.isClosed()
+	case <-s.doneCh:
+		return false
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return false
+	}
+}
+
+func (s *PeerSession) pingLoop() {
+	interval := s.engine.pingInterval
+	if interval <= 0 {
+		interval = defaultPingInterval
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.doneCh:
+			return
+		case <-s.engine.ctx.Done():
+			return
+		case <-ticker.C:
+			if s.isClosed() {
+				return
+			}
+			readTimeout := s.engine.peerReadTimeout()
+			lastSeen := time.Unix(0, s.lastSeenNs.Load())
+			if time.Since(lastSeen) > readTimeout {
+				s.engine.logger.Warn("peer session heartbeat timed out; closing dead session",
+					"remote_node_id", s.NodeID(),
+					"remote_addr", s.RemoteAddr(),
+					"idle_duration", time.Since(lastSeen).String(),
+				)
+				_ = s.Close()
+				s.engine.removeSession(s)
+				return
+			}
+			if err := s.conn.SendPing(time.Now().UnixNano()); err != nil {
+				if !s.isClosed() && s.engine.ctx.Err() == nil {
+					s.engine.logger.Warn("failed to send heartbeat ping to peer; closing session",
+						"remote_node_id", s.NodeID(),
+						"remote_addr", s.RemoteAddr(),
+						"err", err,
+					)
+				}
+				_ = s.Close()
+				s.engine.removeSession(s)
+				return
+			}
+		}
+	}
 }
 
 // FetchBlock requests a single content block by its 32-byte BLAKE3 hash and size from this peer.
@@ -179,13 +319,22 @@ func (s *PeerSession) readLoop() {
 	defer func() {
 		_ = s.Close()
 		s.engine.removeSession(s)
+		if s.engine.ctx.Err() == nil {
+			s.engine.logger.Info("peer session disconnected",
+				"remote_node_id", s.NodeID(),
+				"remote_addr", s.RemoteAddr(),
+			)
+		}
 	}()
 
 	for {
+		if readTimeout := s.engine.peerReadTimeout(); readTimeout > 0 {
+			_ = s.conn.SetReadDeadline(time.Now().Add(readTimeout))
+		}
 		msgType, rawMsg, err := s.conn.Receive()
 		if err != nil {
 			if !s.isClosed() && s.engine.ctx.Err() == nil && !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
-				s.engine.logger.Debug("peer session read ended",
+				s.engine.logger.Warn("peer session read error",
 					"remote_node_id", s.NodeID(),
 					"remote_addr", s.RemoteAddr(),
 					"err", err,
@@ -193,6 +342,8 @@ func (s *PeerSession) readLoop() {
 			}
 			return
 		}
+
+		s.notifyActivity()
 
 		switch msgType {
 		case protocol.MsgIndexExchange:
@@ -244,10 +395,12 @@ func (s *PeerSession) readLoop() {
 			if !ok {
 				continue
 			}
-			_ = s.conn.SendPong(ping.TimestampNs)
+			go func(ts int64) {
+				_ = s.conn.SendPong(ts)
+			}(ping.TimestampNs)
 
 		case protocol.MsgPong:
-			// Liveness confirmed.
+			// Liveness confirmed via notifyActivity().
 		}
 	}
 }
@@ -292,6 +445,8 @@ type Engine struct {
 
 	resolver          discovery.Resolver
 	discoveryInterval time.Duration
+	pingInterval      time.Duration
+	probeTimeout      time.Duration
 	lanTargets        []string
 
 	ctx       context.Context
@@ -370,7 +525,9 @@ func NewEngine(cfg config.Config, st *store.Store, logger *slog.Logger) (*Engine
 		selfAddrs:         make(map[string]bool),
 		reconcileNotify:   make(chan struct{}, 1),
 		blockServeSem:     make(chan struct{}, maxConcurrentBlockServes),
-		discoveryInterval: defaultDiscoveryPoll,
+		discoveryInterval: defaultDiscoveryInterval,
+		pingInterval:      defaultPingInterval,
+		probeTimeout:      defaultProbeTimeout,
 		ctx:               ctx,
 		cancel:            cancel,
 	}, nil
@@ -390,6 +547,29 @@ func (e *Engine) WithDiscoveryInterval(d time.Duration) *Engine {
 		e.discoveryInterval = d
 	}
 	return e
+}
+
+// WithPingInterval configures the heartbeat ping interval for active peer sessions.
+func (e *Engine) WithPingInterval(d time.Duration) *Engine {
+	if d > 0 {
+		e.pingInterval = d
+	}
+	return e
+}
+
+// WithProbeTimeout configures the timeout used when probing an existing session for liveness.
+func (e *Engine) WithProbeTimeout(d time.Duration) *Engine {
+	if d > 0 {
+		e.probeTimeout = d
+	}
+	return e
+}
+
+func (e *Engine) peerReadTimeout() time.Duration {
+	if e.pingInterval <= 0 {
+		return 3 * defaultPingInterval
+	}
+	return 3 * e.pingInterval
 }
 
 // WithLANBroadcastTargets overrides the UDP broadcast targets for LAN discovery.
@@ -489,12 +669,16 @@ func (e *Engine) Start(ctx context.Context) error {
 	e.watcher = watcher
 	e.watcher.Start(e.ctx)
 
-	// 3. Start TLS 1.3 listener on cfg.ListenAddr.
-	ln, err := tls.Listen("tcp", e.cfg.ListenAddr, e.tlsConfig)
+	// 3. Start TLS 1.3 listener on cfg.ListenAddr with TCP keepalive enabled.
+	lc := net.ListenConfig{
+		KeepAlive: defaultTCPKeepAlive,
+	}
+	rawLn, err := lc.Listen(e.ctx, "tcp", e.cfg.ListenAddr)
 	if err != nil {
 		_ = e.watcher.Close()
 		return fmt.Errorf("sync: listen TLS on %q: %w", e.cfg.ListenAddr, err)
 	}
+	ln := tls.NewListener(rawLn, e.tlsConfig)
 	e.listener = ln
 
 	boundAddr, boundPort := resolveBoundAddr(ln.Addr(), e.cfg.ListenAddr)
@@ -646,7 +830,7 @@ func (e *Engine) onLocalChanges(paths []string) {
 		return
 	}
 	for _, fi := range changed {
-		e.logger.Info("local file change indexed",
+		e.logger.Debug("local file change indexed",
 			"path", fi.Path,
 			"type", fi.Type.String(),
 			"size", fi.Size,
@@ -655,7 +839,7 @@ func (e *Engine) onLocalChanges(paths []string) {
 			"version", fi.Version,
 		)
 	}
-	e.logger.Debug("broadcasting local filesystem updates", "count", len(changed))
+	e.logger.Info("broadcasting local filesystem updates", "count", len(changed))
 	e.broadcastIndexUpdate(changed, "")
 }
 
@@ -684,7 +868,7 @@ func (e *Engine) rescanLoop() {
 			}
 			if len(changed) > 0 {
 				for _, fi := range changed {
-					e.logger.Info("periodic rescan detected local change",
+					e.logger.Debug("periodic rescan detected local change",
 						"path", fi.Path,
 						"type", fi.Type.String(),
 						"size", fi.Size,
@@ -692,7 +876,7 @@ func (e *Engine) rescanLoop() {
 						"version", fi.Version,
 					)
 				}
-				e.logger.Debug("periodic rescan detected changes", "count", len(changed))
+				e.logger.Info("periodic rescan detected changes", "count", len(changed))
 				e.broadcastIndexUpdate(changed, "")
 			} else {
 				e.logger.Debug("periodic rescan completed with no changes",
@@ -700,6 +884,9 @@ func (e *Engine) rescanLoop() {
 					"tracked_files", len(e.store.ListFiles()),
 				)
 			}
+			// Anti-entropy: periodically exchange current index with connected peers so any
+			// previously interrupted or transiently failed file reconciliation converges.
+			e.broadcastFullIndexToPeers()
 		}
 	}
 }
@@ -742,7 +929,10 @@ func (e *Engine) onPeerDiscovered(addr string, source string) {
 		defer e.wg.Done()
 		defer e.endDial(addr)
 
-		dialer := &net.Dialer{Timeout: defaultDialTimeout}
+		dialer := &net.Dialer{
+			Timeout:   defaultDialTimeout,
+			KeepAlive: defaultTCPKeepAlive,
+		}
 		tlsConn, err := tls.DialWithDialer(dialer, "tcp", addr, e.tlsConfig)
 		if err != nil {
 			e.logger.Debug("failed to dial peer", "addr", addr, "source", source, "err", err)
@@ -763,7 +953,10 @@ func (e *Engine) DialPeer(ctx context.Context, addr string) error {
 	}
 	defer e.endDial(addr)
 
-	dialer := &net.Dialer{Timeout: defaultDialTimeout}
+	dialer := &net.Dialer{
+		Timeout:   defaultDialTimeout,
+		KeepAlive: defaultTCPKeepAlive,
+	}
 	rawConn, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return err
@@ -828,9 +1021,11 @@ func (e *Engine) handleConn(rawConn net.Conn, isOutbound bool, dialedAddr string
 	if err != nil {
 		_ = pconn.Close()
 		if errors.Is(err, protocol.ErrSelfConnection) && dialedAddr != "" {
-			e.peersMu.Lock()
-			e.selfAddrs[dialedAddr] = true
-			e.peersMu.Unlock()
+			if host, _, splitErr := net.SplitHostPort(dialedAddr); splitErr == nil && net.ParseIP(host) != nil {
+				e.peersMu.Lock()
+				e.selfAddrs[dialedAddr] = true
+				e.peersMu.Unlock()
+			}
 		} else {
 			remoteStr := ""
 			if rawConn.RemoteAddr() != nil {
@@ -846,6 +1041,8 @@ func (e *Engine) handleConn(rawConn net.Conn, isOutbound bool, dialedAddr string
 		return
 	}
 
+	pconn.WithWriteTimeout(defaultWriteTimeout)
+
 	remoteNodeID := peerInfo.NodeID
 	var peerListenAddr string
 	if host, _, splitErr := net.SplitHostPort(peerInfo.RemoteAddr); splitErr == nil && peerInfo.ListenPort > 0 {
@@ -858,6 +1055,21 @@ func (e *Engine) handleConn(rawConn net.Conn, isOutbound bool, dialedAddr string
 	isCanonical := isOutbound == (e.cfg.NodeID < remoteNodeID)
 	session := newPeerSession(e, pconn, peerInfo, isOutbound, isCanonical, dialedAddr, peerListenAddr)
 
+	// If there is an existing session for this peer that would take precedence over the new session
+	// (either existing is canonical, or both are non-canonical), actively probe the existing session
+	// before deciding whether to drop the new connection.
+	// In Docker Swarm, when a peer container restarts or an overlay connection goes half-open,
+	// the surviving node may still hold a dead session in e.peers; probing ensures dead sessions
+	// are immediately replaced while healthy sessions are not thrashed by multi-IP discovery.
+	e.peersMu.RLock()
+	existingCandidate := e.peers[remoteNodeID]
+	e.peersMu.RUnlock()
+
+	existingConfirmedAlive := false
+	if existingCandidate != nil && !existingCandidate.isClosed() && (existingCandidate.isCanonical || !session.isCanonical) {
+		existingConfirmedAlive = existingCandidate.Probe(e.ctx, e.probeTimeout)
+	}
+
 	var replaced *PeerSession
 
 	e.peersMu.Lock()
@@ -868,8 +1080,8 @@ func (e *Engine) handleConn(rawConn net.Conn, isOutbound bool, dialedAddr string
 	}
 
 	if existing, ok := e.peers[remoteNodeID]; ok && !existing.isClosed() {
-		if !session.isCanonical && existing.isCanonical {
-			// Existing session is canonical; drop the new duplicate connection.
+		if (existing.isCanonical || !session.isCanonical) && existing == existingCandidate && existingConfirmedAlive {
+			// Existing session was just verified alive via Ping/Pong; drop the duplicate connection.
 			if dialedAddr != "" {
 				e.addrToNodeID[dialedAddr] = remoteNodeID
 			}
@@ -877,15 +1089,22 @@ func (e *Engine) handleConn(rawConn net.Conn, isOutbound bool, dialedAddr string
 				e.addrToNodeID[peerListenAddr] = remoteNodeID
 			}
 			e.peersMu.Unlock()
-			e.logger.Debug("closing non-canonical duplicate peer connection",
+			e.logger.Debug("closing duplicate peer connection; existing session is healthy",
 				"remote_node_id", remoteNodeID,
 				"is_outbound", isOutbound,
 			)
 			_ = session.Close()
 			return
 		}
-		// New session is canonical (or same direction reconnect); replace existing.
+		// New session is canonical over a non-canonical existing session, or existing session is dead; replace it.
 		replaced = existing
+		if !existingConfirmedAlive {
+			for addr, id := range e.addrToNodeID {
+				if id == remoteNodeID {
+					delete(e.addrToNodeID, addr)
+				}
+			}
+		}
 	}
 
 	e.peers[remoteNodeID] = session
@@ -898,9 +1117,10 @@ func (e *Engine) handleConn(rawConn net.Conn, isOutbound bool, dialedAddr string
 	e.peersMu.Unlock()
 
 	if replaced != nil {
-		e.logger.Debug("replacing previous peer session with canonical connection",
+		e.logger.Info("replacing previous peer session",
 			"remote_node_id", remoteNodeID,
 			"is_outbound", isOutbound,
+			"was_canonical", replaced.isCanonical,
 		)
 		_ = replaced.Close()
 	}
@@ -911,21 +1131,33 @@ func (e *Engine) handleConn(rawConn net.Conn, isOutbound bool, dialedAddr string
 		"is_outbound", isOutbound,
 	)
 
-	// Send initial full IndexExchange (excluding any locally ignored paths).
+	e.wg.Add(1)
+	go func() {
+		defer e.wg.Done()
+		session.pingLoop()
+	}()
+
+	// Send initial full IndexExchange asynchronously so session.readLoop() starts immediately
+	// and both peers can read and write concurrently without deadlocking socket buffers on large indexes.
 	localFiles := e.localIndexForPeer()
-	e.logger.Debug("sending initial IndexExchange to peer",
-		"remote_node_id", remoteNodeID,
-		"entries", len(localFiles),
-	)
-	if err := session.conn.SendIndexExchange(localFiles); err != nil {
-		e.logger.Debug("failed to send initial IndexExchange",
+	e.wg.Add(1)
+	go func() {
+		defer e.wg.Done()
+		e.logger.Debug("sending initial IndexExchange to peer",
 			"remote_node_id", remoteNodeID,
-			"err", err,
+			"entries", len(localFiles),
 		)
-		_ = session.Close()
-		e.removeSession(session)
-		return
-	}
+		if err := sendIndexExchangeBatched(session.conn, localFiles); err != nil {
+			if !session.isClosed() && e.ctx.Err() == nil {
+				e.logger.Warn("failed to send initial IndexExchange",
+					"remote_node_id", remoteNodeID,
+					"err", err,
+				)
+			}
+			_ = session.Close()
+			e.removeSession(session)
+		}
+	}()
 
 	session.readLoop()
 }
@@ -1015,13 +1247,97 @@ func (e *Engine) broadcastIndexUpdate(files []model.FileInfo, excludeNodeID stri
 			"remote_node_id", s.NodeID(),
 			"entries", len(filtered),
 		)
-		if err := s.conn.SendIndexUpdate(filtered); err != nil {
-			e.logger.Debug("failed to send IndexUpdate to peer",
+		if err := sendIndexUpdateBatched(s.conn, filtered); err != nil {
+			e.logger.Warn("failed to send IndexUpdate to peer; closing session",
 				"remote_node_id", s.NodeID(),
 				"err", err,
 			)
+			_ = s.Close()
+			e.removeSession(s)
 		}
 	}
+}
+
+func (e *Engine) broadcastFullIndexToPeers() {
+	e.peersMu.RLock()
+	sessions := make([]*PeerSession, 0, len(e.peers))
+	for _, s := range e.peers {
+		if !s.isClosed() {
+			sessions = append(sessions, s)
+		}
+	}
+	e.peersMu.RUnlock()
+
+	if len(sessions) == 0 {
+		return
+	}
+
+	localFiles := e.localIndexForPeer()
+	if len(localFiles) == 0 {
+		return
+	}
+
+	for _, s := range sessions {
+		if err := sendIndexExchangeBatched(s.conn, localFiles); err != nil {
+			if !s.isClosed() && e.ctx.Err() == nil {
+				e.logger.Warn("failed to send periodic IndexExchange to peer; closing session",
+					"remote_node_id", s.NodeID(),
+					"err", err,
+				)
+			}
+			_ = s.Close()
+			e.removeSession(s)
+		}
+	}
+}
+
+func splitIndexBatches(files []model.FileInfo) [][]model.FileInfo {
+	if len(files) == 0 {
+		return nil
+	}
+	sorted := make([]model.FileInfo, len(files))
+	copy(sorted, files)
+	sortFilesForReconcile(sorted)
+
+	var batches [][]model.FileInfo
+	var cur []model.FileInfo
+	curBlocks := 0
+
+	for _, fi := range sorted {
+		fiBlocks := len(fi.Blocks)
+		if len(cur) > 0 && (len(cur) >= maxFilesPerIndexBatch || curBlocks+fiBlocks > maxBlocksPerIndexBatch) {
+			batches = append(batches, cur)
+			cur = nil
+			curBlocks = 0
+		}
+		cur = append(cur, fi)
+		curBlocks += fiBlocks
+	}
+	if len(cur) > 0 {
+		batches = append(batches, cur)
+	}
+	return batches
+}
+
+func sendIndexExchangeBatched(conn *protocol.Conn, files []model.FileInfo) error {
+	if len(files) == 0 {
+		return conn.SendIndexExchange(nil)
+	}
+	for _, batch := range splitIndexBatches(files) {
+		if err := conn.SendIndexExchange(batch); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func sendIndexUpdateBatched(conn *protocol.Conn, files []model.FileInfo) error {
+	for _, batch := range splitIndexBatches(files) {
+		if err := conn.SendIndexUpdate(batch); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (e *Engine) enqueueReconcile(session *PeerSession, files []model.FileInfo) {
@@ -1099,25 +1415,7 @@ func (e *Engine) reconcileBatch(session *PeerSession, incoming []model.FileInfo)
 	// 1: Non-deleted regular files & symlinks (ascending depth)
 	// 2: Deleted regular files & symlinks (child-first, descending depth)
 	// 3: Deleted directories (child-first, descending depth)
-	sort.SliceStable(filtered, func(i, j int) bool {
-		a, b := filtered[i], filtered[j]
-		catA, catB := reconcileCategory(a), reconcileCategory(b)
-		if catA != catB {
-			return catA < catB
-		}
-		depthA := strings.Count(a.Path, "/")
-		depthB := strings.Count(b.Path, "/")
-		if catA <= 1 {
-			if depthA != depthB {
-				return depthA < depthB
-			}
-			return a.Path < b.Path
-		}
-		if depthA != depthB {
-			return depthA > depthB
-		}
-		return a.Path > b.Path
-	})
+	sortFilesForReconcile(filtered)
 
 	var broadcastOther []model.FileInfo
 	var replySender []model.FileInfo
@@ -1129,11 +1427,9 @@ func (e *Engine) reconcileBatch(session *PeerSession, incoming []model.FileInfo)
 
 		pathMu := e.getPathLock(remoteFI.Path)
 		pathMu.Lock()
-		e.opMu.Lock()
 
 		otherUpdates, senderUpdates, err := e.reconcileSingleFile(e.ctx, remoteFI, session)
 
-		e.opMu.Unlock()
 		pathMu.Unlock()
 
 		if err != nil {
@@ -1165,9 +1461,38 @@ func (e *Engine) reconcileBatch(session *PeerSession, incoming []model.FileInfo)
 	}
 	if len(replySender) > 0 && senderNodeID != "" {
 		if activeSess := e.getSession(senderNodeID); activeSess != nil {
-			_ = activeSess.conn.SendIndexUpdate(replySender)
+			if err := sendIndexUpdateBatched(activeSess.conn, replySender); err != nil {
+				e.logger.Warn("failed to send reply IndexUpdate to peer; closing session",
+					"remote_node_id", senderNodeID,
+					"err", err,
+				)
+				_ = activeSess.Close()
+				e.removeSession(activeSess)
+			}
 		}
 	}
+}
+
+func sortFilesForReconcile(files []model.FileInfo) {
+	sort.SliceStable(files, func(i, j int) bool {
+		a, b := files[i], files[j]
+		catA, catB := reconcileCategory(a), reconcileCategory(b)
+		if catA != catB {
+			return catA < catB
+		}
+		depthA := strings.Count(a.Path, "/")
+		depthB := strings.Count(b.Path, "/")
+		if catA <= 1 {
+			if depthA != depthB {
+				return depthA < depthB
+			}
+			return a.Path < b.Path
+		}
+		if depthA != depthB {
+			return depthA > depthB
+		}
+		return a.Path > b.Path
+	})
 }
 
 func reconcileCategory(fi model.FileInfo) int {
@@ -1197,24 +1522,59 @@ func (e *Engine) reconcileSingleFile(
 		return nil, nil, nil
 	}
 
+	e.opMu.Lock()
+
 	// Ensure any unindexed local change on disk for this path is reflected in Store first.
-	_, _, _ = e.scanner.ScanPath(remoteFI.Path)
+	_, localUpdated, _ := e.scanner.ScanPath(remoteFI.Path)
 
 	localFI, exists := e.store.GetFile(remoteFI.Path)
 
 	// Case A: File has never been seen on this node.
 	if !exists {
 		if remoteFI.Deleted {
-			if err := e.store.PutFile(remoteFI); err != nil {
+			err := e.store.PutFile(remoteFI)
+			e.opMu.Unlock()
+			if err != nil {
 				return nil, nil, err
 			}
 			return []model.FileInfo{remoteFI}, nil, nil
 		}
 
-		if err := e.writer.ApplyRemoteFile(ctx, remoteFI, e.fetchBlockWithFallback(session)); err != nil {
-			return nil, nil, err
+		if remoteFI.Type != model.FileTypeRegular {
+			err := e.writer.ApplyRemoteFile(ctx, remoteFI, nil)
+			e.opMu.Unlock()
+			if err != nil {
+				return nil, nil, err
+			}
+			e.logger.Debug("synced new entry from peer",
+				"path", remoteFI.Path,
+				"type", remoteFI.Type.String(),
+				"size", remoteFI.Size,
+				"from_peer", session.NodeID(),
+				"version", remoteFI.Version,
+			)
+			return []model.FileInfo{remoteFI}, nil, nil
 		}
-		e.logger.Info("synced new entry from peer",
+
+		// Stage regular file blocks outside opMu so network I/O never blocks local watcher scans.
+		e.opMu.Unlock()
+		stagingPath, stageErr := e.writer.StageRegularFile(ctx, remoteFI, e.fetchBlockWithFallback(session))
+		if stageErr != nil {
+			return nil, nil, stageErr
+		}
+
+		e.opMu.Lock()
+		if _, changedWhileStaging, _ := e.scanner.ScanPath(remoteFI.Path); changedWhileStaging {
+			e.opMu.Unlock()
+			_ = os.Remove(stagingPath)
+			return e.reconcileSingleFile(ctx, remoteFI, session)
+		}
+		commitErr := e.writer.CommitStagedRegularFile(stagingPath, remoteFI)
+		e.opMu.Unlock()
+		if commitErr != nil {
+			return nil, nil, commitErr
+		}
+		e.logger.Debug("synced new entry from peer",
 			"path", remoteFI.Path,
 			"type", remoteFI.Type.String(),
 			"size", remoteFI.Size,
@@ -1226,28 +1586,72 @@ func (e *Engine) reconcileSingleFile(
 
 	// Case B: File exists in local Store.
 	cmp := remoteFI.Version.Compare(localFI.Version)
+	if cmp == model.CmpEqual && !sameLogicalContent(localFI, remoteFI) {
+		cmp = model.CmpConcurrent
+	}
+
 	switch cmp {
 	case model.CmpEqual:
-		// Already converged.
+		e.opMu.Unlock()
+		if localUpdated {
+			return []model.FileInfo{localFI}, nil, nil
+		}
 		return nil, nil, nil
 
 	case model.CmpDominated:
 		// Local version is strictly newer than remote (local > remote).
-		// Inform the sender about our newer version.
+		// Inform the sender (and other peers if just scanned locally) about our newer version.
+		e.opMu.Unlock()
+		if localUpdated {
+			return []model.FileInfo{localFI}, []model.FileInfo{localFI}, nil
+		}
 		return nil, []model.FileInfo{localFI}, nil
 
 	case model.CmpDominates:
 		// Remote version is strictly newer than local (remote > local).
 		if remoteFI.Deleted && remoteFI.Type == model.FileTypeDir && e.hasActiveChildren(remoteFI.Path) {
-			if err := e.store.PutFile(remoteFI); err != nil {
+			err := e.store.PutFile(remoteFI)
+			e.opMu.Unlock()
+			if err != nil {
 				return nil, nil, err
 			}
 			return []model.FileInfo{remoteFI}, nil, nil
 		}
-		if err := e.writer.ApplyRemoteFile(ctx, remoteFI, e.fetchBlockWithFallback(session)); err != nil {
-			return nil, nil, err
+		if remoteFI.Deleted || remoteFI.Type != model.FileTypeRegular {
+			err := e.writer.ApplyRemoteFile(ctx, remoteFI, nil)
+			e.opMu.Unlock()
+			if err != nil {
+				return nil, nil, err
+			}
+			e.logger.Debug("synced updated entry from peer",
+				"path", remoteFI.Path,
+				"type", remoteFI.Type.String(),
+				"size", remoteFI.Size,
+				"deleted", remoteFI.Deleted,
+				"from_peer", session.NodeID(),
+				"version", remoteFI.Version,
+			)
+			return []model.FileInfo{remoteFI}, nil, nil
 		}
-		e.logger.Info("synced updated entry from peer",
+
+		e.opMu.Unlock()
+		stagingPath, stageErr := e.writer.StageRegularFile(ctx, remoteFI, e.fetchBlockWithFallback(session))
+		if stageErr != nil {
+			return nil, nil, stageErr
+		}
+
+		e.opMu.Lock()
+		if _, changedWhileStaging, _ := e.scanner.ScanPath(remoteFI.Path); changedWhileStaging {
+			e.opMu.Unlock()
+			_ = os.Remove(stagingPath)
+			return e.reconcileSingleFile(ctx, remoteFI, session)
+		}
+		commitErr := e.writer.CommitStagedRegularFile(stagingPath, remoteFI)
+		e.opMu.Unlock()
+		if commitErr != nil {
+			return nil, nil, commitErr
+		}
+		e.logger.Debug("synced updated entry from peer",
 			"path", remoteFI.Path,
 			"type", remoteFI.Type.String(),
 			"size", remoteFI.Size,
@@ -1289,21 +1693,46 @@ func (e *Engine) reconcileSingleFile(
 
 		if remoteWon {
 			if winner.Deleted && localFI.Deleted {
-				if err := e.store.PutFile(winner); err != nil {
+				err := e.store.PutFile(winner)
+				e.opMu.Unlock()
+				if err != nil {
 					return nil, nil, err
 				}
 			} else if winner.Deleted && winner.Type == model.FileTypeDir && e.hasActiveChildren(winner.Path) {
-				if err := e.store.PutFile(winner); err != nil {
+				err := e.store.PutFile(winner)
+				e.opMu.Unlock()
+				if err != nil {
+					return nil, nil, err
+				}
+			} else if winner.Deleted || winner.Type != model.FileTypeRegular {
+				err := e.writer.ApplyRemoteFile(ctx, winner, nil)
+				e.opMu.Unlock()
+				if err != nil {
 					return nil, nil, err
 				}
 			} else {
-				if err := e.writer.ApplyRemoteFile(ctx, winner, e.fetchBlockWithFallback(session)); err != nil {
-					return nil, nil, err
+				e.opMu.Unlock()
+				stagingPath, stageErr := e.writer.StageRegularFile(ctx, winner, e.fetchBlockWithFallback(session))
+				if stageErr != nil {
+					return nil, nil, stageErr
+				}
+				e.opMu.Lock()
+				if _, changedWhileStaging, _ := e.scanner.ScanPath(remoteFI.Path); changedWhileStaging {
+					e.opMu.Unlock()
+					_ = os.Remove(stagingPath)
+					return e.reconcileSingleFile(ctx, remoteFI, session)
+				}
+				commitErr := e.writer.CommitStagedRegularFile(stagingPath, winner)
+				e.opMu.Unlock()
+				if commitErr != nil {
+					return nil, nil, commitErr
 				}
 			}
 		} else {
 			// Local version won (or attributes are already identical on disk): persist merged VersionVector.
-			if err := e.store.PutFile(winner); err != nil {
+			err := e.store.PutFile(winner)
+			e.opMu.Unlock()
+			if err != nil {
 				return nil, nil, err
 			}
 			if isConflict {
@@ -1319,7 +1748,25 @@ func (e *Engine) reconcileSingleFile(
 		return toOtherPeers, toSender, nil
 
 	default:
+		e.opMu.Unlock()
 		return nil, nil, nil
+	}
+}
+
+func sameLogicalContent(a, b model.FileInfo) bool {
+	if a.Deleted && b.Deleted {
+		return true
+	}
+	if a.Deleted != b.Deleted || a.Type != b.Type {
+		return false
+	}
+	switch a.Type {
+	case model.FileTypeRegular:
+		return a.Size == b.Size && a.FileHash == b.FileHash
+	case model.FileTypeSymlink:
+		return a.SymlinkTarget == b.SymlinkTarget
+	default:
+		return true
 	}
 }
 

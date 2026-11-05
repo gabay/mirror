@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -693,5 +694,79 @@ func TestWatcherDebounceAndDynamicSubdirs(t *testing.T) {
 	}
 	if !seenPhase2["a.txt"] {
 		t.Fatalf("expected watcher to detect deletion of a.txt, got %v", seenPhase2)
+	}
+}
+
+func TestScannerQueueOverflowDotTriggersFullScan(t *testing.T) {
+	rootDir := t.TempDir()
+	stateDir := t.TempDir()
+
+	st, err := store.Open(stateDir)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer st.Close()
+
+	logger := newTestLogger(&safeBuffer{})
+	matcher := ignore.NewMatcher(nil)
+	scanner := NewScanner(rootDir, "node-overflow", st, matcher, logger)
+
+	if err := os.WriteFile(filepath.Join(rootDir, "overflow.txt"), []byte("overflow-data"), 0o644); err != nil {
+		t.Fatalf("write overflow.txt: %v", err)
+	}
+
+	// Watcher enqueues "." when IN_Q_OVERFLOW occurs.
+	changed, err := scanner.ScanPaths([]string{"."})
+	if err != nil {
+		t.Fatalf("ScanPaths([\".\"]): %v", err)
+	}
+	if len(changed) != 1 || changed[0].Path != "overflow.txt" {
+		t.Fatalf("expected ScanPaths([\".\"]) to perform full scan and find overflow.txt, got %+v", changed)
+	}
+}
+
+func TestWatcherContinuousWritesDoNotStarveFlush(t *testing.T) {
+	rootDir := t.TempDir()
+	logger := newTestLogger(&safeBuffer{})
+	matcher := ignore.NewMatcher(nil)
+
+	flushedCh := make(chan []string, 8)
+	w, err := NewWatcher(rootDir, matcher, 200*time.Millisecond, func(paths []string) {
+		select {
+		case flushedCh <- paths:
+		default:
+		}
+	}, logger)
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	defer w.Close()
+
+	// Continuously write every 50ms (< 200ms debounceDelay) for 2.5s.
+	// Without a maxWait cap, timer.Reset would starve flush() for the entire 2.5s loop.
+	stopWriters := make(chan struct{})
+	defer close(stopWriters)
+	go func() {
+		i := 0
+		ticker := time.NewTicker(50 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopWriters:
+				return
+			case <-ticker.C:
+				i++
+				_ = os.WriteFile(filepath.Join(rootDir, "busy.log"), []byte(fmt.Sprintf("line-%d", i)), 0o644)
+			}
+		}
+	}()
+
+	select {
+	case paths := <-flushedCh:
+		if len(paths) == 0 || paths[0] != "busy.log" {
+			t.Fatalf("unexpected flushed paths: %v", paths)
+		}
+	case <-time.After(2500 * time.Millisecond):
+		t.Fatalf("watcher debounce flush was starved by continuous writes")
 	}
 }

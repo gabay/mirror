@@ -12,6 +12,8 @@ import (
 const (
 	// DefaultDNSPollInterval is the default interval between Docker Swarm DNS lookups.
 	DefaultDNSPollInterval = 5 * time.Second
+	// defaultDNSLookupTimeout bounds individual DNS resolution calls.
+	defaultDNSLookupTimeout = 5 * time.Second
 )
 
 // Resolver abstracts DNS IP lookups so unit tests can mock Docker Swarm tasks.<service> responses.
@@ -100,9 +102,13 @@ func (d *DNSDiscoverer) PollOnce(ctx context.Context) []string {
 			continue
 		}
 
-		addrs, err := d.resolver.LookupIPAddr(ctx, host)
+		lookupCtx, cancel := context.WithTimeout(ctx, defaultDNSLookupTimeout)
+		addrs, err := d.resolver.LookupIPAddr(lookupCtx, host)
+		cancel()
 		if err != nil {
-			d.logger.Debug("dns discovery lookup failed", "host", host, "err", err)
+			if ctx.Err() == nil {
+				d.logger.Warn("dns discovery lookup failed", "host", host, "err", err)
+			}
 			continue
 		}
 
